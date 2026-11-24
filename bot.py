@@ -545,16 +545,45 @@ async def set_rating(callback: CallbackQuery, state: FSMContext):
 
 
 @router.message(RateStates.waiting_for_comment)
-async def save_comment(message: Message, state: FSMContext):
+async def save_comment(message: Message, state: FSMContext, bot: Bot):
     data = await state.get_data()
+    companion_id = data["companion_id"]
+    rating = data["rating"]
     comment = message.text.strip() if message.text and message.text.strip() != "-" else None
     await add_rating(
-        data["companion_id"], message.from_user.id,
-        message.from_user.username, data["rating"], comment,
+        companion_id, message.from_user.id,
+        message.from_user.username, rating, comment,
     )
     await state.clear()
+
+    companion = await get_companion(companion_id)
+    cname = companion["name"] if companion else str(companion_id)
+    # id последнего отзыва
+    avg, reviews = await get_ratings(companion_id, limit=1)
+    last_id = reviews[0][0] if reviews else 0
+
     user_is_admin = is_admin(message.from_user.id)
-    await message.answer("Спасибо! Оценка сохранена ❤️", reply_markup=main_menu_kb(user_is_admin))
+    await message.answer(
+        f"Спасибо! Оценка сохранена ❤️\n(отзыв #{last_id})",
+        reply_markup=main_menu_kb(user_is_admin),
+    )
+
+    # Админам сразу кнопка удалить
+    if last_id:
+        uname = f"@{message.from_user.username}" if message.from_user.username else message.from_user.full_name
+        cmt = f"\n«{comment}»" if comment else ""
+        kb = InlineKeyboardBuilder()
+        kb.row(InlineKeyboardButton(
+            text=f"🗑 Удалить отзыв #{last_id}",
+            callback_data=f"delrev_{last_id}_{companion_id}",
+        ))
+        await notify_admins(
+            bot,
+            f"⭐ Новый отзыв #{last_id}\n"
+            f"Компаньон: <b>{cname}</b>\n"
+            f"Оценка: {rating}★ от {uname}{cmt}",
+            reply_markup=kb.as_markup(),
+        )
 
 
 @router.callback_query(F.data.startswith("reviews_"))
