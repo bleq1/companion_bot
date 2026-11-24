@@ -23,15 +23,30 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 # Несколько админов через запятую: ADMIN_ID=111,222,333
-_ADMIN_RAW = os.getenv("ADMIN_ID", "0")
-ADMIN_IDS = {int(x.strip()) for x in _ADMIN_RAW.split(",") if x.strip().isdigit()}
+_ADMIN_RAW = os.getenv("ADMIN_ID", "0") or "0"
+
+
+def _parse_admin_ids(raw: str) -> set[int]:
+    ids = set()
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip().strip('"').strip("'")
+        if not part:
+            continue
+        # только цифры (и опциональный минус не нужен для tg id)
+        digits = "".join(ch for ch in part if ch.isdigit())
+        if digits:
+            ids.add(int(digits))
+    return ids
+
+
+ADMIN_IDS = _parse_admin_ids(_ADMIN_RAW)
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-app.vercel.app")
 # На хостинге (Railway/Render) приходит PORT; локально — 8080
 API_PORT = int(os.getenv("PORT") or os.getenv("API_PORT") or "8080")
 
 
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return int(user_id) in ADMIN_IDS
 
 
 async def notify_admins(bot: Bot, text: str, photo_file_id=None, reply_markup=None):
@@ -176,6 +191,18 @@ async def delete_rating(rating_id: int) -> bool:
         cur = await db.execute("DELETE FROM ratings WHERE id = ?", (rating_id,))
         await db.commit()
         return cur.rowcount > 0
+
+
+async def get_all_ratings(limit=30):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            """SELECT r.id, r.rating, r.comment, r.username, r.companion_id, c.name
+               FROM ratings r
+               LEFT JOIN companions c ON c.id = r.companion_id
+               ORDER BY r.created_at DESC LIMIT ?""",
+            (limit,),
+        ) as cur:
+            return await cur.fetchall()
 
 
 async def get_companions(active_only=True):
@@ -340,6 +367,7 @@ def admin_kb():
     builder = InlineKeyboardBuilder()
     builder.row(InlineKeyboardButton(text="📋 Заявки на модерацию", callback_data="admin_apps"))
     builder.row(InlineKeyboardButton(text="👥 Список компаньонов", callback_data="admin_comps"))
+    builder.row(InlineKeyboardButton(text="🗑 Все отзывы", callback_data="admin_reviews"))
     builder.row(InlineKeyboardButton(text="« В меню", callback_data="back_main"))
     return builder.as_markup()
 
@@ -357,6 +385,32 @@ async def cmd_start(message: Message, state: FSMContext):
         "Нажми кнопку ниже ↓"
     )
     await message.answer(text, reply_markup=main_menu_kb(user_is_admin), parse_mode="HTML")
+
+
+
+@router.message(Command("id"))
+async def cmd_id(message: Message):
+    uid = message.from_user.id
+    await message.answer(
+        f"Ваш Telegram ID: <code>{uid}</code>\n"
+        f"Админ: <b>{'да' if is_admin(uid) else 'нет'}</b>\n"
+        f"Админов в конфиге: {len(ADMIN_IDS)}",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        await message.answer(
+            f"Нет доступа.\nВаш ID: <code>{message.from_user.id}</code>\n"
+            f"Пропишите его в ADMIN_ID на Railway.",
+            parse_mode="HTML",
+        )
+        return
+    pending = await get_pending_applications()
+    text = f"<b>Админ-панель</b>\n\nЗаявок на модерации: <b>{len(pending)}</b>"
+    await message.answer(text, reply_markup=admin_kb(), parse_mode="HTML")
 
 
 @router.callback_query(F.data == "back_main")
@@ -514,6 +568,11 @@ async def show_reviews(callback: CallbackQuery):
     admin = is_admin(callback.from_user.id)
     if not reviews:
         text = f"Пока нет отзывов о <b>{companion['name']}</b>."
+        if admin:
+            text += (
+                "\n\nЧтобы появилась кнопка удаления, сначала оставьте оценку "
+                "через «Оставить оценку», затем снова откройте отзывы."
+            )
         builder = InlineKeyboardBuilder()
         builder.row(InlineKeyboardButton(text="« Назад", callback_data=f"comp_{companion_id}"))
         await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
@@ -574,6 +633,42 @@ async def admin_delete_review(callback: CallbackQuery):
             await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
     else:
         await callback.answer("Уже удалён или не найден", show_alert=True)
+
+
+
+@router.callback_query(F.data == "admin_reviews")
+async def admin_all_reviews(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    rows = await get_all_ratings(25)
+    if not rows:
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="« Назад", callback_data="admin"))
+        await callback.message.answer(
+            "Отзывов пока нет.\n"
+            "Сначала кто-то должен нажать «Оставить оценку» у анкеты.",
+            reply_markup=builder.as_markup(),
+        )
+        await callback.answer()
+        return
+
+    text = "<b>Все отзывы</b>\n\n"
+    builder = InlineKeyboardBuilder()
+    for r in rows:
+        rid, rating, comment, username, cid, cname = r
+        user = f"@{username}" if username else "Аноним"
+        cmt = f" — «{(comment or '')[:40]}»" if comment else ""
+        text += f"#{rid} {cname or '?'} · {'⭐' * rating} · {user}{cmt}\n"
+        builder.row(
+            InlineKeyboardButton(
+                text=f"🗑 #{rid} {cname or ''} ({rating}★)",
+                callback_data=f"delrev_{rid}_{cid or 0}",
+            )
+        )
+    builder.row(InlineKeyboardButton(text="« Назад", callback_data="admin"))
+    await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    await callback.answer()
 
 
 # ---------- SUPPORT ----------
@@ -1133,7 +1228,7 @@ async def main():
     await site.start()
     logger.info(f"API для приложения: http://0.0.0.0:{API_PORT}/api/companions")
 
-    logger.info("Бот запущен")
+    logger.info("Бот запущен, админов: %s, ids=%s", len(ADMIN_IDS), sorted(ADMIN_IDS))
     try:
         await dp.start_polling(bot)
     finally:
