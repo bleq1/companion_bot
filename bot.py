@@ -158,17 +158,24 @@ async def add_rating(companion_id, user_id, username, rating, comment):
         await db.commit()
 
 
-async def get_ratings(companion_id):
+async def get_ratings(companion_id, limit=20):
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute(
-            "SELECT rating, comment, username, created_at FROM ratings WHERE companion_id = ? ORDER BY created_at DESC LIMIT 15",
-            (companion_id,),
+            "SELECT id, rating, comment, username, created_at FROM ratings WHERE companion_id = ? ORDER BY created_at DESC LIMIT ?",
+            (companion_id, limit),
         ) as cur:
             rows = await cur.fetchall()
         if not rows:
             return 0.0, []
-        avg = sum(r[0] for r in rows) / len(rows)
+        avg = sum(r[1] for r in rows) / len(rows)
         return round(avg, 1), rows
+
+
+async def delete_rating(rating_id: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("DELETE FROM ratings WHERE id = ?", (rating_id,))
+        await db.commit()
+        return cur.rowcount > 0
 
 
 async def get_companions(active_only=True):
@@ -504,19 +511,69 @@ async def show_reviews(callback: CallbackQuery):
         await callback.answer("Не найден", show_alert=True)
         return
     avg, reviews = await get_ratings(companion_id)
+    admin = is_admin(callback.from_user.id)
     if not reviews:
         text = f"Пока нет отзывов о <b>{companion['name']}</b>."
-    else:
-        text = f"<b>Отзывы о {companion['name']}</b>\nСредняя: ⭐ {avg}/5\n\n"
-        for r in reviews[:8]:
-            rating, comment, username, _ = r
-            user = f"@{username}" if username else "Аноним"
-            cmt = f" — «{comment}»" if comment else ""
-            text += f"{'⭐' * rating} от {user}{cmt}\n"
+        builder = InlineKeyboardBuilder()
+        builder.row(InlineKeyboardButton(text="« Назад", callback_data=f"comp_{companion_id}"))
+        await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        await callback.answer()
+        return
+
+    text = f"<b>Отзывы о {companion['name']}</b>\nСредняя: ⭐ {avg}/5\n\n"
+    for r in reviews[:10]:
+        rid, rating, comment, username, _ = r
+        user = f"@{username}" if username else "Аноним"
+        cmt = f" — «{comment}»" if comment else ""
+        text += f"#{rid} {'⭐' * rating} от {user}{cmt}\n"
+
     builder = InlineKeyboardBuilder()
+    if admin:
+        # Кнопки удаления для каждого отзыва
+        for r in reviews[:10]:
+            rid, rating, comment, username, _ = r
+            label = f"🗑 Удалить #{rid} ({rating}★)"
+            builder.row(InlineKeyboardButton(text=label, callback_data=f"delrev_{rid}_{companion_id}"))
     builder.row(InlineKeyboardButton(text="« Назад", callback_data=f"comp_{companion_id}"))
     await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
     await callback.answer()
+
+
+@router.callback_query(F.data.startswith("delrev_"))
+async def admin_delete_review(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    parts = callback.data.split("_")
+    rating_id = int(parts[1])
+    companion_id = int(parts[2])
+    ok = await delete_rating(rating_id)
+    if ok:
+        await callback.answer("Отзыв удалён")
+        # Обновляем список
+        companion = await get_companion(companion_id)
+        avg, reviews = await get_ratings(companion_id)
+        if not reviews:
+            text = f"Пока нет отзывов о <b>{companion['name'] if companion else ''}</b>."
+            builder = InlineKeyboardBuilder()
+            builder.row(InlineKeyboardButton(text="« Назад", callback_data=f"comp_{companion_id}"))
+            await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+            return
+        text = f"<b>Отзывы о {companion['name']}</b>\nСредняя: ⭐ {avg}/5\n\n"
+        builder = InlineKeyboardBuilder()
+        for r in reviews[:10]:
+            rid, rating, comment, username, _ = r
+            user = f"@{username}" if username else "Аноним"
+            cmt = f" — «{comment}»" if comment else ""
+            text += f"#{rid} {'⭐' * rating} от {user}{cmt}\n"
+            builder.row(InlineKeyboardButton(text=f"🗑 Удалить #{rid} ({rating}★)", callback_data=f"delrev_{rid}_{companion_id}"))
+        builder.row(InlineKeyboardButton(text="« Назад", callback_data=f"comp_{companion_id}"))
+        try:
+            await callback.message.edit_text(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+        except Exception:
+            await callback.message.answer(text, reply_markup=builder.as_markup(), parse_mode="HTML")
+    else:
+        await callback.answer("Уже удалён или не найден", show_alert=True)
 
 
 # ---------- SUPPORT ----------
@@ -835,6 +892,7 @@ async def admin_comp_card(callback: CallbackQuery, state: FSMContext):
     kb.row(InlineKeyboardButton(text="✏️ О себе", callback_data=f"ed_about_{companion_id}"),
            InlineKeyboardButton(text="✏️ Username", callback_data=f"ed_username_{companion_id}"))
     kb.row(InlineKeyboardButton(text="🖼 Фото", callback_data=f"ed_photo_{companion_id}"))
+    kb.row(InlineKeyboardButton(text="📝 Отзывы / удалить", callback_data=f"reviews_{companion_id}"))
     kb.row(InlineKeyboardButton(text="🗑 Удалить анкету", callback_data=f"adel_{companion_id}"))
     kb.row(InlineKeyboardButton(text="« К списку", callback_data="admin_comps"))
 
